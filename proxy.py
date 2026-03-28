@@ -1,235 +1,373 @@
 #!/usr/bin/env python3
 """
-RecordPlus HLS Proxy
-====================
-Faz login automático, captura os tokens Akamai e expõe URLs fixas para VLC.
+RecordPlus HLS Proxy  v2
+========================
+Links fixos para VLC:
+  http://<IP>:8888/channel/sp
+  http://<IP>:8888/channel/rio
+  http://<IP>:8888/channel/minas
 
-Links fixos gerados:
-  http://<IP_VPS>:8888/channel/sp
-  http://<IP_VPS>:8888/channel/rio
-  http://<IP_VPS>:8888/channel/minas
-
-Os tokens são renovados automaticamente a cada 30 minutos.
+Diagnóstico:
+  http://<IP>:8888/debug
 """
 
-import threading
-import time
-import logging
+import re
 import sys
+import time
+import threading
+import logging
+import traceback
 from urllib.parse import quote, unquote, urlparse
 
 import requests
 from flask import Flask, Response, request as req, abort
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CONFIGURAÇÃO
+# CONFIG
 # ──────────────────────────────────────────────────────────────────────────────
 EMAIL    = "jean.fraga20@gmail.com"
 PASSWORD = "qwerty123"
 
+PROFILE_ID   = "8a7ea0f8-c8c1-4a29-b424-14bbf7ee9275"
+PROFILE_NAME = "jean"
+
 CHANNELS = {
-    "sp":    "https://www.recordplus.com/Live/LiveEvent/180?groupId=7",
-    "rio":   "https://www.recordplus.com/live/liveEvent/182?groupId=7",
-    "minas": "https://www.recordplus.com/live/liveEvent/186?groupId=7",
+    "sp":    {"name": "Record SP",    "event_id": "180", "group_id": "7"},
+    "rio":   {"name": "Record Rio",   "event_id": "182", "group_id": "7"},
+    "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
 }
 
 PORT             = 8888
-REFRESH_INTERVAL = 1800   # renova tokens a cada 30 min
-CAPTURE_TIMEOUT  = 12000  # ms que o Playwright aguarda o player iniciar
+REFRESH_INTERVAL = 1800
+BASE_URL         = "https://www.recordplus.com"
+UA               = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
 
 # ──────────────────────────────────────────────────────────────────────────────
 # LOGGING
 # ──────────────────────────────────────────────────────────────────────────────
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s  %(levelname)-7s  %(message)s",
-    handlers=[
-        logging.StreamHandler(sys.stdout),
-        logging.FileHandler("/var/log/recordplus-proxy.log"),
-    ],
-)
-log = logging.getLogger("recordplus")
+log = logging.getLogger("rp")
+log.setLevel(logging.DEBUG)
+_fmt = logging.Formatter("%(asctime)s  %(levelname)-7s  %(message)s")
+_sh  = logging.StreamHandler(sys.stdout)
+_sh.setFormatter(_fmt)
+log.addHandler(_sh)
+try:
+    _fh = logging.FileHandler("/var/log/recordplus-proxy.log")
+    _fh.setFormatter(_fmt)
+    log.addHandler(_fh)
+except Exception:
+    pass
+
+debug_log: list = []
+
+def _dbg(msg: str, level: str = "info") -> None:
+    getattr(log, level)(msg)
+    sys.stdout.flush()
+    debug_log.append(f"[{time.strftime('%H:%M:%S')}] {msg}")
+    if len(debug_log) > 300:
+        debug_log.pop(0)
 
 # ──────────────────────────────────────────────────────────────────────────────
-# ESTADO GLOBAL
+# ESTADO
 # ──────────────────────────────────────────────────────────────────────────────
-streams: dict = {}   # ch → {"master_url": str, "session": requests.Session}
+streams: dict = {}
 lock = threading.Lock()
 
 # ──────────────────────────────────────────────────────────────────────────────
-# CAPTURA DE STREAMS (Playwright headless)
+# HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
+def _extract_m3u8(text: str) -> str | None:
+    """Procura qualquer URL m3u8 dentro de uma string HTML/JSON."""
+    patterns = [
+        r'https://[^\s"\'<>\\]+master\.m3u8[^\s"\'<>\\]*',
+        r'https://[^\s"\'<>\\]+\.m3u8[^\s"\'<>\\]*',
+    ]
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m.group(0).replace("\\/", "/")
+    return None
 
-def _make_session(ctx) -> requests.Session:
-    """Cria uma requests.Session com os cookies Akamai do contexto do browser."""
+
+def _make_akamai_session(cookies: dict) -> requests.Session:
     s = requests.Session()
-    for c in ctx.cookies():
-        if "akamai" in c.get("domain", "") or c["name"] in ("hdntl", "hdnts"):
-            s.cookies.set(c["name"], c["value"], domain=c.get("domain"))
+    for k, v in cookies.items():
+        s.cookies.set(k, v)
     s.headers.update({
-        "User-Agent": (
-            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/124.0.0.0 Safari/537.36"
-        ),
-        "Referer": "https://www.recordplus.com/",
-        "Origin":  "https://www.recordplus.com",
+        "User-Agent": UA,
+        "Referer":    BASE_URL + "/",
+        "Origin":     BASE_URL,
     })
     return s
 
 
-def fetch_streams() -> None:
-    """Abre o browser, faz login e captura a URL master.m3u8 de cada canal."""
-    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+# ──────────────────────────────────────────────────────────────────────────────
+# ABORDAGEM 1: requests puro
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_via_requests() -> dict:
+    _dbg("[requests] Iniciando…")
+    results: dict = {}
 
-    new_streams: dict = {}
+    s = requests.Session()
+    s.headers.update({"User-Agent": UA, "Accept-Language": "pt-BR,pt;q=0.9"})
+
+    # 1. GET login page → CSRF token
+    _dbg("[requests] GET login page…")
+    r = s.get(f"{BASE_URL}/account/login", timeout=20)
+    r.raise_for_status()
+
+    csrf = re.search(
+        r'__RequestVerificationToken[^>]+value="([^"]+)"', r.text
+    ) or re.search(
+        r'name="__RequestVerificationToken"\s+[^>]*value="([^"]+)"', r.text
+    )
+    csrf_token = csrf.group(1) if csrf else ""
+    _dbg(f"[requests] CSRF: {'encontrado' if csrf_token else 'NÃO encontrado'}")
+
+    # 2. POST login
+    _dbg("[requests] POST login…")
+    r = s.post(
+        f"{BASE_URL}/account/login",
+        data={
+            "__RequestVerificationToken": csrf_token,
+            "UserName": EMAIL,
+            "Password": PASSWORD,
+        },
+        timeout=20,
+        allow_redirects=True,
+    )
+    _dbg(f"[requests] Após login → {r.url}  status={r.status_code}")
+
+    if "escolhaseuperfil" not in r.url.lower() and "home" not in r.url.lower():
+        raise Exception(f"Login falhou. URL final: {r.url}")
+
+    # 3. Seleção de perfil
+    if "escolhaseuperfil" in r.url.lower():
+        _dbg("[requests] Selecionando perfil…")
+        for ep in [
+            f"{BASE_URL}/account/SelectProfile",
+            f"{BASE_URL}/Account/SelectProfile",
+            f"{BASE_URL}/account/escolhaseuperfil",
+        ]:
+            try:
+                rp = s.post(
+                    ep,
+                    data={"profileId": PROFILE_ID, "ProfileId": PROFILE_ID},
+                    timeout=15,
+                    allow_redirects=True,
+                )
+                _dbg(f"[requests]   {ep} → {rp.status_code} {rp.url}")
+                if rp.status_code < 400:
+                    break
+            except Exception as e:
+                _dbg(f"[requests]   {ep} erro: {e}")
+
+        s.get(f"{BASE_URL}/home", timeout=15, allow_redirects=True)
+
+    # 4. Captura stream de cada canal
+    for ch, info in CHANNELS.items():
+        ch_url = f"{BASE_URL}/Live/LiveEvent/{info['event_id']}?groupId={info['group_id']}"
+        _dbg(f"[requests] [{ch.upper()}] GET {ch_url}")
+        try:
+            r = s.get(ch_url, timeout=20)
+            _dbg(f"[requests] [{ch.upper()}] {r.status_code} / {len(r.text)} chars")
+            m3u8 = _extract_m3u8(r.text)
+            if m3u8:
+                _dbg(f"[requests] [{ch.upper()}] ✓ {m3u8[:80]}…")
+                results[ch] = {
+                    "master_url": m3u8,
+                    "session":    _make_akamai_session(dict(s.cookies)),
+                }
+            else:
+                _dbg(f"[requests] [{ch.upper()}] m3u8 não encontrado no HTML")
+                # Salva HTML para debug
+                debug_log.append(f"--- HTML snippet [{ch}] ---")
+                debug_log.append(r.text[:500])
+        except Exception as e:
+            _dbg(f"[requests] [{ch.upper()}] ERRO: {e}")
+
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# ABORDAGEM 2: Playwright headless
+# ──────────────────────────────────────────────────────────────────────────────
+def _fetch_via_playwright() -> dict:
+    _dbg("[playwright] Importando…")
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout  # noqa
+
+    results: dict = {}
 
     with sync_playwright() as pw:
+        _dbg("[playwright] Lançando Chromium…")
         browser = pw.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"],
+            args=[
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
+                "--single-process",
+            ],
         )
-        ctx = browser.new_context(
-            user_agent=(
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 720},
-        )
+        ctx = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 720})
         page = ctx.new_page()
 
-        # ── 1. Login ──────────────────────────────────────────────────────
-        log.info("Acessando página de login…")
+        # Login
+        _dbg("[playwright] GET login…")
         try:
-            page.goto(
-                "https://www.recordplus.com/account/login",
-                wait_until="networkidle",
-                timeout=30000,
-            )
+            page.goto(f"{BASE_URL}/account/login",
+                      wait_until="domcontentloaded", timeout=30000)
         except PWTimeout:
-            page.goto("https://www.recordplus.com/account/login")
-            page.wait_for_timeout(3000)
+            pass
 
+        page.wait_for_timeout(2000)
         page.fill("#UserName", EMAIL)
         page.fill("#Password", PASSWORD)
         page.click("button[type=submit]")
 
         try:
             page.wait_for_url("**/escolhaseuperfil**", timeout=15000)
+            _dbg(f"[playwright] Redirecionado: {page.url}")
         except PWTimeout:
-            log.error("Não redirecionou para seleção de perfil — verifique credenciais.")
-            browser.close()
-            return
+            _dbg(f"[playwright] URL após submit: {page.url}")
 
-        # ── 2. Seleciona perfil ──────────────────────────────────────────
-        log.info("Selecionando perfil…")
-        try:
-            # Tenta clicar no perfil 'jean' especificamente
-            page.click("img.profile-img[onclick*='jean']", timeout=5000)
-        except Exception:
-            # Fallback: clica no primeiro perfil disponível
-            page.click("img.profile-img", timeout=5000)
+        # Perfil
+        if "escolhaseuperfil" in page.url.lower():
+            _dbg("[playwright] Clicando no perfil…")
+            try:
+                page.click(f"img.profile-img[onclick*='{PROFILE_ID}']", timeout=5000)
+            except Exception:
+                try:
+                    page.click("img.profile-img", timeout=5000)
+                except Exception as e:
+                    _dbg(f"[playwright] aviso clique perfil: {e}")
+            try:
+                page.wait_for_url("**/home**", timeout=15000)
+            except PWTimeout:
+                page.wait_for_timeout(3000)
+            _dbg(f"[playwright] URL após perfil: {page.url}")
 
-        try:
-            page.wait_for_url("**/home**", timeout=15000)
-        except PWTimeout:
-            # Às vezes redireciona direto para outra URL
-            page.wait_for_timeout(4000)
-
-        log.info("Login OK. Capturando streams…")
-
-        # ── 3. Captura por canal ──────────────────────────────────────────
-        for ch, ch_url in CHANNELS.items():
-            log.info(f"  [{ch.upper()}] Navegando para {ch_url}")
+        # Captura por canal
+        for ch, info in CHANNELS.items():
+            ch_url = (f"{BASE_URL}/Live/LiveEvent/{info['event_id']}"
+                      f"?groupId={info['group_id']}")
             captured: dict = {}
 
-            def _on_req(r, _cap=captured, _ch=ch):
-                if "master.m3u8" in r.url and "akamai" in r.url:
-                    if "master_url" not in _cap:
-                        _cap["master_url"] = r.url
-                        log.info(f"  [{_ch.upper()}] ✓ master.m3u8 capturado")
+            def _on_req(r, _c=captured, _ch=ch):
+                if "master.m3u8" in r.url and not _c.get("master_url"):
+                    _c["master_url"] = r.url
+                    _dbg(f"[playwright] [{_ch.upper()}] ✓ capturado: {r.url[:70]}")
 
             page.on("request", _on_req)
-
+            _dbg(f"[playwright] [{ch.upper()}] Navegando…")
             try:
                 page.goto(ch_url, wait_until="networkidle", timeout=25000)
             except PWTimeout:
                 page.wait_for_timeout(3000)
 
-            # Aguarda o player iniciar e emitir a requisição m3u8
-            deadline = time.time() + CAPTURE_TIMEOUT / 1000
-            while "master_url" not in captured and time.time() < deadline:
+            for _ in range(24):
+                if "master_url" in captured:
+                    break
                 page.wait_for_timeout(500)
 
             page.remove_listener("request", _on_req)
 
             if "master_url" not in captured:
-                log.warning(f"  [{ch.upper()}] master.m3u8 NÃO capturado — pulando.")
-                continue
+                _dbg(f"[playwright] [{ch.upper()}] network não capturou, tentando HTML…")
+                m3u8 = _extract_m3u8(page.content())
+                if m3u8:
+                    captured["master_url"] = m3u8
+                    _dbg(f"[playwright] [{ch.upper()}] ✓ extraído do HTML")
+                else:
+                    _dbg(f"[playwright] [{ch.upper()}] ✗ não encontrado")
 
-            session = _make_session(ctx)
-            new_streams[ch] = {
-                "master_url": captured["master_url"],
-                "session":    session,
-            }
+            if "master_url" in captured:
+                ak_s = _make_akamai_session(
+                    {c["name"]: c["value"] for c in ctx.cookies()}
+                )
+                results[ch] = {"master_url": captured["master_url"], "session": ak_s}
 
         browser.close()
 
-    if new_streams:
+    return results
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# LOOP DE RENOVAÇÃO
+# ──────────────────────────────────────────────────────────────────────────────
+def fetch_streams() -> None:
+    _dbg("=" * 50)
+    _dbg("CAPTURA DE STREAMS INICIADA")
+    _dbg("=" * 50)
+
+    new: dict = {}
+
+    # Tenta requests primeiro
+    try:
+        new = _fetch_via_requests()
+        _dbg(f"[requests] capturados: {list(new.keys())}")
+    except Exception:
+        _dbg("[requests] FALHA:\n" + traceback.format_exc())
+
+    # Se faltou algum, tenta Playwright
+    missing = [ch for ch in CHANNELS if ch not in new]
+    if missing:
+        _dbg(f"Faltam {missing} — tentando Playwright…")
+        try:
+            pw = _fetch_via_playwright()
+            new.update(pw)
+            _dbg(f"[playwright] capturados: {list(pw.keys())}")
+        except Exception:
+            _dbg("[playwright] FALHA:\n" + traceback.format_exc())
+
+    if new:
         with lock:
             streams.clear()
-            streams.update(new_streams)
-        log.info(f"Streams prontos: {list(new_streams.keys())}")
+            streams.update(new)
+        _dbg(f"✅ Streams ativos: {list(new.keys())}")
     else:
-        log.error("Nenhum stream capturado nesta rodada.")
+        _dbg("❌ Nenhum stream — acesse /debug para ver o log completo")
 
 
 def _refresh_loop() -> None:
-    """Thread em background que renova os tokens periodicamente."""
     while True:
         try:
             fetch_streams()
-        except Exception as exc:
-            log.exception(f"Erro ao renovar streams: {exc}")
-        log.info(f"Próxima renovação em {REFRESH_INTERVAL // 60} minutos.")
+        except Exception:
+            _dbg("ERRO CRÍTICO:\n" + traceback.format_exc())
+        _dbg(f"Próxima renovação em {REFRESH_INTERVAL // 60} min")
         time.sleep(REFRESH_INTERVAL)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # PROXY HLS
 # ──────────────────────────────────────────────────────────────────────────────
-
 def _proxy_url(url: str) -> str:
-    """Retorna a URL local do proxy para uma URL upstream."""
     return f"/proxy?u={quote(url, safe='')}"
 
 
 def _rewrite_m3u8(content: str, base_url: str) -> str:
-    """Reescreve URLs dentro de um arquivo m3u8 para passar pelo proxy local."""
-    parsed   = urlparse(base_url)
+    parsed    = urlparse(base_url)
     base_root = f"{parsed.scheme}://{parsed.netloc}"
-    lines = content.splitlines()
-    out   = []
-
-    for line in lines:
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
+    out = []
+    for line in content.splitlines():
+        s = line.strip()
+        if not s or s.startswith("#"):
             out.append(line)
-            continue
-
-        if stripped.startswith("http://") or stripped.startswith("https://"):
-            out.append(_proxy_url(stripped))
+        elif s.startswith("http"):
+            out.append(_proxy_url(s))
         else:
-            # caminho relativo → absoluto
-            abs_url = base_root + "/" + stripped.lstrip("/")
-            out.append(_proxy_url(abs_url))
-
+            out.append(_proxy_url(base_root + "/" + s.lstrip("/")))
     return "\n".join(out)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# FLASK ROUTES
+# FLASK
 # ──────────────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -237,50 +375,60 @@ app = Flask(__name__)
 @app.route("/")
 def index():
     host = req.host.split(":")[0]
-    rows = "\n".join(
+    rows = "".join(
         f"<tr><td><b>{ch.upper()}</b></td>"
-        f"<td><a href='http://{host}:{PORT}/channel/{ch}'>"
-        f"http://{host}:{PORT}/channel/{ch}</a></td>"
+        f"<td>{CHANNELS[ch]['name']}</td>"
+        f"<td><code>http://{host}:{PORT}/channel/{ch}</code></td>"
         f"<td>{'✅ Pronto' if ch in streams else '⏳ Aguardando'}</td></tr>"
         for ch in CHANNELS
     )
-    return f"""<!DOCTYPE html>
-<html><head><meta charset='utf-8'><title>RecordPlus Proxy</title></head>
-<body style='font-family:sans-serif;padding:2em'>
-<h2>📺 RecordPlus HLS Proxy</h2>
-<p>Abra os links abaixo no VLC: <b>Mídia → Abrir fluxo de rede</b></p>
-<table border='1' cellpadding='8' cellspacing='0'>
-<tr><th>Canal</th><th>URL para VLC</th><th>Status</th></tr>
-{rows}
-</table>
-<p><small>Tokens renovam automaticamente a cada {REFRESH_INTERVAL//60} minutos.</small></p>
-</body></html>"""
+    return (
+        "<!DOCTYPE html><html><head><meta charset='utf-8'>"
+        "<title>RecordPlus Proxy</title></head>"
+        "<body style='font-family:sans-serif;padding:2em'>"
+        "<h2>📺 RecordPlus HLS Proxy v2</h2>"
+        "<p>Use os links abaixo no VLC via <b>Mídia → Abrir fluxo de rede</b></p>"
+        "<table border='1' cellpadding='8'>"
+        "<tr><th>ID</th><th>Canal</th><th>URL p/ VLC</th><th>Status</th></tr>"
+        f"{rows}</table>"
+        "<p><a href='/debug'>🔍 Ver log de diagnóstico</a></p>"
+        "</body></html>"
+    )
+
+
+@app.route("/debug")
+def debug():
+    with lock:
+        active = {ch: streams[ch]["master_url"][:90] + "…" for ch in streams}
+    lines = "\n".join(debug_log[-150:])
+    return Response(
+        f"STREAMS ATIVOS:\n{active}\n\n{'='*50}\nLOG:\n{lines}",
+        mimetype="text/plain; charset=utf-8",
+    )
 
 
 @app.route("/channel/<ch>")
 def channel(ch: str):
     if ch not in CHANNELS:
-        abort(404, f"Canal '{ch}' não existe. Disponíveis: {list(CHANNELS)}")
-
+        abort(404)
     with lock:
         info = streams.get(ch)
-
     if not info:
-        abort(503, "Stream ainda não disponível. Aguarde o proxy inicializar (~30 s).")
-
-    master_url = info["master_url"]
-    session    = info["session"]
-
+        return Response(
+            "Stream ainda não disponível. Aguarde ~60 s e tente novamente.\n"
+            f"Diagnóstico: http://{req.host}/debug",
+            status=503,
+            mimetype="text/plain",
+        )
     try:
-        r = session.get(master_url, timeout=10)
+        r = info["session"].get(info["master_url"], timeout=12)
         r.raise_for_status()
-    except Exception as exc:
-        log.error(f"[{ch}] Erro ao buscar master.m3u8: {exc}")
-        abort(502, "Erro ao buscar stream upstream.")
+    except Exception as e:
+        _dbg(f"[{ch}] Erro upstream: {e}")
+        abort(502)
 
-    content = _rewrite_m3u8(r.text, master_url)
     return Response(
-        content,
+        _rewrite_m3u8(r.text, info["master_url"]),
         mimetype="application/x-mpegURL",
         headers={"Cache-Control": "no-cache, no-store"},
     )
@@ -288,72 +436,57 @@ def channel(ch: str):
 
 @app.route("/proxy")
 def proxy():
-    raw = req.args.get("u", "")
-    if not raw:
-        abort(400, "Parâmetro 'u' obrigatório.")
-    url = unquote(raw)
-
-    # Pega a primeira session disponível (todas têm os mesmos cookies Akamai)
+    url = unquote(req.args.get("u", ""))
+    if not url:
+        abort(400)
     with lock:
         sessions = [v["session"] for v in streams.values()]
-
     if not sessions:
-        abort(503, "Proxy ainda inicializando.")
-
-    session = sessions[0]
-
+        abort(503)
     try:
-        upstream = session.get(url, stream=True, timeout=15)
-        upstream.raise_for_status()
-    except Exception as exc:
-        log.warning(f"Proxy erro para {url[:80]}: {exc}")
-        abort(502, str(exc))
+        up = sessions[0].get(url, stream=True, timeout=15)
+        up.raise_for_status()
+    except Exception as e:
+        _dbg(f"proxy erro: {e}", "warning")
+        abort(502)
 
-    ct = upstream.headers.get("Content-Type", "application/octet-stream")
-
-    if "mpegURL" in ct or url.endswith(".m3u8"):
-        # Playlist aninhada → reescreve também
-        content = _rewrite_m3u8(upstream.text, url)
+    ct = up.headers.get("Content-Type", "application/octet-stream")
+    if "mpegURL" in ct or url.split("?")[0].endswith(".m3u8"):
         return Response(
-            content,
+            _rewrite_m3u8(up.text, url),
             mimetype="application/x-mpegURL",
             headers={"Cache-Control": "no-cache"},
         )
-    else:
-        # Segmento TS / binário → stream direto
-        def _stream():
-            for chunk in upstream.iter_content(chunk_size=65536):
-                if chunk:
-                    yield chunk
 
-        return Response(
-            _stream(),
-            mimetype=ct,
-            headers={
-                "Cache-Control": "no-cache",
-                "Accept-Ranges":  "bytes",
-            },
-        )
+    def _stream():
+        for chunk in up.iter_content(65536):
+            if chunk:
+                yield chunk
+
+    return Response(_stream(), mimetype=ct,
+                    headers={"Cache-Control": "no-cache", "Accept-Ranges": "bytes"})
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 # MAIN
 # ──────────────────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info("=" * 60)
-    log.info("  RecordPlus HLS Proxy  |  porta %d", PORT)
-    log.info("=" * 60)
+    print("=" * 50, flush=True)
+    print(f"  RecordPlus Proxy v2  |  porta {PORT}", flush=True)
+    print("=" * 50, flush=True)
 
-    t = threading.Thread(target=_refresh_loop, daemon=True, name="token-refresh")
+    t = threading.Thread(target=_refresh_loop, daemon=True, name="refresh")
     t.start()
 
-    # Aguarda a primeira captura antes de levantar o Flask
-    log.info("Aguardando captura inicial de streams…")
-    for _ in range(120):          # até 60 s
+    print("Aguardando captura inicial (máx 90 s)…", flush=True)
+    for _ in range(180):
         time.sleep(0.5)
         with lock:
             if streams:
                 break
 
-    log.info("Servidor Flask iniciando em 0.0.0.0:%d", PORT)
+    print(f"Streams: {list(streams.keys()) or 'nenhum — acesse /debug'}", flush=True)
+    print(f"Iniciando Flask em 0.0.0.0:{PORT}", flush=True)
+    sys.stdout.flush()
+
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
