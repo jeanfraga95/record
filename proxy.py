@@ -225,14 +225,31 @@ def _fetch_via_playwright():
         except PWTimeout:
             pass
 
-        page.wait_for_timeout(2000)
+        # Aguarda o formulário carregar completamente via JS
+        page.wait_for_timeout(4000)
+        _dbg(f"[playwright] URL atual antes do login: {page.url}")
+
+        # Preenche campos
         page.fill("#UserName", EMAIL)
+        page.wait_for_timeout(500)
         page.fill("#Password", PASSWORD)
-        page.click("button[type=submit]")
+        page.wait_for_timeout(500)
+
+        # O site tem 2 botões submit; o botão real é .main-button
+        _dbg("[playwright] Clicando em Avançar (button.main-button)…")
+        try:
+            page.click("button.main-button", timeout=10000)
+        except Exception as e1:
+            _dbg(f"[playwright] .main-button falhou ({e1}), tentando last submit…")
+            try:
+                page.locator("button[type=submit]").last.click(timeout=10000)
+            except Exception as e2:
+                _dbg(f"[playwright] last submit falhou ({e2}), submetendo via JS…")
+                page.evaluate("document.querySelector('form').submit()")
 
         try:
-            page.wait_for_url("**/escolhaseuperfil**", timeout=15000)
-            _dbg(f"[playwright] Redirecionado: {page.url}")
+            page.wait_for_url("**/escolhaseuperfil**", timeout=20000)
+            _dbg(f"[playwright] Redirecionado para perfil: {page.url}")
         except PWTimeout:
             _dbg(f"[playwright] URL após submit: {page.url}")
 
