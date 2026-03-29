@@ -80,7 +80,7 @@ lock = threading.Lock()
 # ──────────────────────────────────────────────────────────────────────────────
 # HELPERS
 # ──────────────────────────────────────────────────────────────────────────────
-def _extract_m3u8(text: str) -> str | None:
+def _extract_m3u8(text: str):
     """Procura qualquer URL m3u8 dentro de uma string HTML/JSON."""
     patterns = [
         r'https://[^\s"\'<>\\]+master\.m3u8[^\s"\'<>\\]*',
@@ -108,7 +108,7 @@ def _make_akamai_session(cookies: dict) -> requests.Session:
 # ──────────────────────────────────────────────────────────────────────────────
 # ABORDAGEM 1: requests puro
 # ──────────────────────────────────────────────────────────────────────────────
-def _fetch_via_requests() -> dict:
+def _fetch_via_requests():
     _dbg("[requests] Iniciando…")
     results: dict = {}
 
@@ -196,7 +196,7 @@ def _fetch_via_requests() -> dict:
 # ──────────────────────────────────────────────────────────────────────────────
 # ABORDAGEM 2: Playwright headless
 # ──────────────────────────────────────────────────────────────────────────────
-def _fetch_via_playwright() -> dict:
+def _fetch_via_playwright():
     _dbg("[playwright] Importando…")
     from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout  # noqa
 
