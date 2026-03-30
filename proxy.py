@@ -73,6 +73,7 @@ def _dbg(msg, level="info"):
 streams        = {}
 akamai_cookies = {}
 lock           = threading.Lock()
+_renewing      = False   # evita renovacoes simultaneas
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def _extract_m3u8(text):
@@ -111,6 +112,30 @@ def _hdntl_for_url(url):
             if d in domain or domain in d:
                 return v
     return None
+
+
+def _trigger_refresh():
+    """Dispara renovacao imediata em background se nao houver uma em andamento."""
+    global _renewing
+    with lock:
+        if _renewing:
+            return
+        _renewing = True
+
+    def _run():
+        global _renewing
+        _dbg("⚡ Renovacao de emergencia iniciada!")
+        try:
+            fetch_streams()
+        except Exception:
+            _dbg("ERRO na renovacao de emergencia:\n" + traceback.format_exc())
+        finally:
+            global _renewing
+            _renewing = False
+            _dbg("⚡ Renovacao de emergencia concluida.")
+
+    t = threading.Thread(target=_run, daemon=True, name="emergency-refresh")
+    t.start()
 
 
 # ── PLAYWRIGHT ────────────────────────────────────────────────────────────────
@@ -497,8 +522,11 @@ def channel(ch):
         r = _make_akamai_request(master_url, hdntl_val)
         r.raise_for_status()
     except Exception as e:
-        _dbg("[%s] Erro upstream: %s" % (ch, e))
-        abort(502)
+        _dbg("[%s] Erro upstream: %s — disparando renovacao" % (ch, e))
+        _trigger_refresh()
+        return Response(
+            "Stream temporariamente indisponivel. Renovando tokens, tente novamente em 30s.",
+            status=503, mimetype="text/plain")
 
     content = _rewrite_m3u8(r.text, master_url)
     return Response(content, mimetype="application/x-mpegURL",
@@ -533,8 +561,11 @@ def channel_quality(ch, quality):
         r = _make_akamai_request(variant_url, hdntl_val)
         r.raise_for_status()
     except Exception as e:
-        _dbg("[%s/%s] Erro upstream: %s" % (ch, quality, e))
-        abort(502)
+        _dbg("[%s/%s] Erro upstream: %s — disparando renovacao" % (ch, quality, e))
+        _trigger_refresh()
+        return Response(
+            "Stream temporariamente indisponivel. Renovando tokens, tente novamente em 30s.",
+            status=503, mimetype="text/plain")
 
     content = _rewrite_m3u8(r.text, variant_url)
     return Response(content, mimetype="application/x-mpegURL",
@@ -559,6 +590,7 @@ def proxy():
         up.raise_for_status()
     except Exception as e:
         _dbg("proxy err: %s -> %s" % (e, url[:60]), "warning")
+        _trigger_refresh()
         abort(502)
 
     ct = up.headers.get("Content-Type", "application/octet-stream")
