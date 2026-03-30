@@ -27,21 +27,21 @@ PASSWORD     = "qwerty123"
 PROFILE_ID   = "8a7ea0f8-c8c1-4a29-b424-14bbf7ee9275"
 
 CHANNELS = {
-    "sp":    {"name": "Record SP",    "event_id": "180", "group_id": "7"},
-    "rio":   {"name": "Record Rio",   "event_id": "182", "group_id": "7"},
+    "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"},
+    "rio": {"name": "Record Rio", "event_id": "182", "group_id": "7"},
     "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
-    "Guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
-    "Bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
-    "Brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
-    "Goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
-    "Belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
-    "Manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
-    "Santos e Vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
-    "Bahia Itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
-    "Bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
-    "Rio Preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
-    "Ribeirão Preto": {"name": "Record Ribeirão Preto", "event_id": "601", "group_id": "7"},
-    "Campos dos Goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
+    "guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
+    "bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
+    "brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
+    "goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
+    "belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
+    "manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
+    "santos_vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
+    "bahia_itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
+    "bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
+    "rio_preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
+    "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
+    "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
 }
 
 PORT             = 8888
@@ -271,14 +271,17 @@ def _fetch_via_playwright():
 
             # Canais com redirect (cdnsimba etc): busca body via requests direto
             if captured.get("needs_fetch") and not captured.get("master_body"):
+                origin_url = master_url   # URL original antes do redirect (token curto)
                 _dbg("[playwright] [%s] Buscando body via requests (%s)…" % (
                     ch.upper(), ak_domain))
                 try:
-                    r = requests.get(master_url, headers={"User-Agent": UA}, timeout=10)
+                    r = requests.get(origin_url, headers={"User-Agent": UA}, timeout=10,
+                                     allow_redirects=True)
                     r.raise_for_status()
                     captured["master_body"] = r.text
-                    # Atualiza URL final apos possiveis redirects
-                    if r.url != master_url:
+                    captured["origin_url"]  = origin_url   # guarda URL pre-redirect
+                    # Atualiza URL final apos redirect (contém token curto, só p/ debug)
+                    if r.url != origin_url:
                         master_url = r.url
                         captured["master_url"] = master_url
                         ak_domain = urlparse(master_url).netloc
@@ -320,6 +323,7 @@ def _fetch_via_playwright():
                 "hdntl":       hdntl_val or "",
                 "ak_domain":   ak_domain,
                 "variants":    variants,
+                "origin_url":  captured.get("origin_url", ""),  # URL pre-redirect (cdnsimba)
             }
 
         browser.close()
@@ -424,6 +428,29 @@ def _parse_variants(content, base_url):
         variants["sd"] = variants.get("low") or variants.get("hd") or variants.get("fhd", "")
 
     return {k: v for k, v in variants.items() if k in ("fhd", "hd", "sd") and v}
+
+
+def _fetch_master_live(info):
+    """
+    Re-busca o master.m3u8 ao vivo e retorna (body, master_url).
+    - Canais cdnsimba: re-faz GET na origin_url (pre-redirect) para obter token fresco.
+    - Canais Akamai:   re-faz GET com cookie hdntl.
+    """
+    origin_url = info.get("origin_url", "")
+    master_url = info["master_url"]
+    hdntl_val  = info.get("hdntl", "")
+
+    if origin_url:
+        # cdnsimba: origin_url gera redirect com novo token a cada requisicao
+        r = requests.get(origin_url, headers={"User-Agent": UA},
+                         timeout=10, allow_redirects=True)
+        r.raise_for_status()
+        return r.text, r.url
+    else:
+        # Akamai: usa hdntl cookie
+        r = _make_akamai_request(master_url, hdntl_val)
+        r.raise_for_status()
+        return r.text, master_url
 
 
 # ── FLASK ─────────────────────────────────────────────────────────────────────
@@ -546,26 +573,18 @@ def channel(ch):
     master_url  = info["master_url"]
     hdntl_val   = info.get("hdntl", "")
 
-    # Se temos o conteudo cacheado, servimos direto (sem re-fetch ao Akamai)
-    if master_body:
-        _dbg("[%s] Servindo master cacheado (%d bytes)" % (ch, len(master_body)))
-        content = _rewrite_m3u8(master_body, master_url)
-        return Response(content, mimetype="application/x-mpegURL",
-                        headers={"Cache-Control": "no-cache, no-store"})
-
-    # Fallback: busca do Akamai com o cookie correto
-    _dbg("[%s] Buscando master do Akamai…" % ch)
+    # Sempre re-busca o master ao vivo para garantir tokens frescos
+    _dbg("[%s] Buscando master ao vivo…" % ch)
     try:
-        r = _make_akamai_request(master_url, hdntl_val)
-        r.raise_for_status()
+        body, live_url = _fetch_master_live(info)
     except Exception as e:
         _dbg("[%s] Erro upstream: %s — disparando renovacao" % (ch, e))
         _trigger_refresh()
         return Response(
-            "Stream temporariamente indisponivel. Renovando tokens, tente novamente em 30s.",
+            "Stream temporariamente indisponivel. Renovando tokens, tente em 15s.",
             status=503, mimetype="text/plain")
 
-    content = _rewrite_m3u8(r.text, master_url)
+    content = _rewrite_m3u8(body, live_url)
     return Response(content, mimetype="application/x-mpegURL",
                     headers={"Cache-Control": "no-cache, no-store"})
 
@@ -592,16 +611,24 @@ def channel_quality(ch, quality):
             "Qualidade '%s' nao disponivel para o canal %s." % (quality, ch),
             status=404, mimetype="text/plain")
 
-    # Busca a playlist da variante com o cookie correto e reescreve URLs
+    # Re-busca master ao vivo para obter variantes com tokens frescos
     hdntl_val = info.get("hdntl", "")
     try:
-        r = _make_akamai_request(variant_url, hdntl_val)
+        master_body_live, live_url = _fetch_master_live(info)
+        fresh_variants = _parse_variants(master_body_live, live_url)
+        variant_url = fresh_variants.get(quality) or variant_url
+    except Exception as e:
+        _dbg("[%s/%s] Erro ao re-buscar master: %s" % (ch, quality, e))
+        # Continua com variant_url cacheada como fallback
+
+    try:
+        r = _make_akamai_request(variant_url, hdntl_val) if "akamai" in variant_url             else requests.get(variant_url, headers={"User-Agent": UA}, timeout=12)
         r.raise_for_status()
     except Exception as e:
         _dbg("[%s/%s] Erro upstream: %s — disparando renovacao" % (ch, quality, e))
         _trigger_refresh()
         return Response(
-            "Stream temporariamente indisponivel. Renovando tokens, tente novamente em 30s.",
+            "Stream temporariamente indisponivel. Renovando tokens, tente em 15s.",
             status=503, mimetype="text/plain")
 
     content = _rewrite_m3u8(r.text, variant_url)
@@ -623,7 +650,12 @@ def proxy():
         hdntl_val = vals[0] if vals else None
 
     try:
-        up = _make_akamai_request(url, hdntl_val, stream=True)
+        if hdntl_val:
+            up = _make_akamai_request(url, hdntl_val, stream=True)
+        else:
+            # CDN aberto (cdnsimba etc): sem cookie, segue redirects
+            up = requests.get(url, headers={"User-Agent": UA},
+                              stream=True, timeout=15, allow_redirects=True)
         up.raise_for_status()
     except Exception as e:
         _dbg("proxy err: %s -> %s" % (e, url[:60]), "warning")
