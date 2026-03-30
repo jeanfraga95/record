@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 """
 RecordPlus HLS Proxy  v3
@@ -27,23 +26,22 @@ EMAIL        = "jean.fraga20@gmail.com"
 PASSWORD     = "qwerty123"
 PROFILE_ID   = "8a7ea0f8-c8c1-4a29-b424-14bbf7ee9275"
 
-CHANNELS = {
-    "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"},
-    "rio": {"name": "Record Rio", "event_id": "182", "group_id": "7"},
-    "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
-    "guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
-    "bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
-    "brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
-    "goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
-    "belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
-    "manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
-    "santos_vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
-    "bahia_itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
-    "bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
-    "rio_preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
-    "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
-    "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
-}
+CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"},     
+            "rio": {"name": "Record Rio", "event_id": "182", "group_id": "7"},
+            "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
+            "guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
+            "bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
+            "brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
+            "goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
+            "belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
+            "manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
+            "santos_vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
+            "bahia_itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
+            "bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
+            "rio_preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
+            "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
+            "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
+           }
 
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min
@@ -381,18 +379,47 @@ def _proxy_url(url):
     return "/proxy?u=%s" % quote(url, safe="")
 
 
+def _abs_url(url, base_root):
+    """Converte URL relativa em absoluta."""
+    if url.startswith("http"):
+        return url
+    return base_root + "/" + url.lstrip("/")
+
+
 def _rewrite_m3u8(content, base_url):
+    """
+    Reescreve todas as URLs de uma playlist HLS para passar pelo proxy local.
+    Trata:
+      - linhas de URL (após #EXT-X-STREAM-INF etc.)
+      - URI= dentro de #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF e similares
+    """
     parsed    = urlparse(base_url)
     base_root = "%s://%s" % (parsed.scheme, parsed.netloc)
     out = []
+
+    def _rewrite_uri_attr(line):
+        """Substitui URI="..." dentro de uma tag HLS pelo URL do proxy."""
+        def _replace(m):
+            original = m.group(1)
+            abs_u    = _abs_url(original, base_root)
+            return 'URI="%s"' % _proxy_url(abs_u)
+        return re.sub(r'URI="([^"]+)"', _replace, line)
+
     for line in content.splitlines():
         s = line.strip()
-        if not s or s.startswith("#"):
+        if not s:
             out.append(line)
+        elif s.startswith("#"):
+            # Reescreve URI= dentro de tags como #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF
+            if 'URI="' in s:
+                out.append(_rewrite_uri_attr(line))
+            else:
+                out.append(line)
         elif s.startswith("http"):
             out.append(_proxy_url(s))
         else:
             out.append(_proxy_url(base_root + "/" + s.lstrip("/")))
+
     return "\n".join(out)
 
 
@@ -726,17 +753,28 @@ def proxy():
 
     # Para cdnsimba: renova token antes de buscar
     if "cdnsimba" in url and not hdntl_val:
-        # Descobre qual canal tem origin_url correspondente
+        # Encontra o canal cujo cache_base bate com o domínio da URL
+        req_domain = urlparse(url).netloc
+        origin_url = None
         with lock:
-            origin_url = next(
-                (v.get("origin_url") for v in streams.values()
-                 if v.get("origin_url") and "cdnsimba" in v.get("origin_url", "")),
-                None
-            )
+            for v in streams.values():
+                vo = v.get("origin_url", "")
+                if not vo or "cdnsimba" not in vo:
+                    continue
+                # Verifica se o token cacheado para esta origin_url tem o mesmo cache_base
+                cached = _simba_token_cache.get(vo)
+                if cached and req_domain in cached.get("cache_base", ""):
+                    origin_url = vo
+                    break
+            if not origin_url:
+                # Fallback: qualquer canal cdnsimba
+                origin_url = next(
+                    (v.get("origin_url") for v in streams.values()
+                     if "cdnsimba" in v.get("origin_url", "")), None
+                )
         if origin_url:
             fresh_url = _simba_url_with_fresh_token(url, origin_url)
             if fresh_url != url:
-                _dbg("proxy [simba] token renovado para segmento")
                 url = fresh_url
 
     try:
@@ -777,15 +815,8 @@ if __name__ == "__main__":
     t = threading.Thread(target=_refresh_loop, daemon=True, name="refresh")
     t.start()
 
-    print("Aguardando captura inicial (max 120s)…", flush=True)
-    for _ in range(240):
-        time.sleep(0.5)
-        with lock:
-            if streams:
-                break
-
-    print("Streams: %s" % list(streams.keys()), flush=True)
-    print("Iniciando Flask em 0.0.0.0:%d" % PORT, flush=True)
+    # Flask sobe imediatamente — captura roda em background
+    print("Flask subindo agora. Streams chegarao em ~2min.", flush=True)
     sys.stdout.flush()
 
     app.run(host="0.0.0.0", port=PORT, threaded=True, use_reloader=False)
