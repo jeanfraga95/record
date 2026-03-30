@@ -408,8 +408,46 @@ def index():
         "<table border='1' cellpadding='8' cellspacing='0'>"
         "<tr><th>Canal</th><th>Qualidade</th><th>URL para VLC</th><th>Status</th></tr>"
         + "".join(rows) +
-        "</table><br><a href='/debug'>Log de diagnostico</a>"
+        "</table><br>"
+        "<a href='/playlist.m3u' download='recordplus.m3u'>"
+        "<button style='margin-right:12px;padding:8px 18px;font-size:14px;background:#e53935;color:#fff;border:none;border-radius:4px;cursor:pointer'>"
+        "&#11123; Baixar playlist M3U</button></a>"
+        "<a href='/debug'>Log de diagnostico</a>"
         "</body></html>"
+    )
+
+
+@app.route("/playlist.m3u")
+def playlist_m3u():
+    host = req.host.split(":")[0]
+    QUALITY_LABEL = {"fhd": "Full HD 1080p", "hd": "HD 720p", "sd": "SD 480p"}
+    lines = ["#EXTM3U"]
+    with lock:
+        snap = dict(streams)
+    for ch, info in snap.items():
+        ch_name  = CHANNELS[ch]["name"]
+        variants = info.get("variants", {})
+        # Entrada "todos" (master com selecao automatica)
+        lines.append(
+            '#EXTINF:-1 tvg-id="%s" tvg-name="%s" group-title="RecordPlus",%s' % (
+                ch, ch_name, ch_name)
+        )
+        lines.append("http://%s:%d/channel/%s" % (host, PORT, ch))
+        # Entradas por qualidade
+        for q in ("fhd", "hd", "sd"):
+            if q not in variants:
+                continue
+            label = "%s (%s)" % (ch_name, QUALITY_LABEL[q])
+            lines.append(
+                '#EXTINF:-1 tvg-id="%s_%s" tvg-name="%s" group-title="RecordPlus %s",%s' % (
+                    ch, q, label, QUALITY_LABEL[q], label)
+            )
+            lines.append("http://%s:%d/channel/%s/%s" % (host, PORT, ch, q))
+    content = "\n".join(lines) + "\n"
+    return Response(
+        content,
+        mimetype="audio/x-mpegurl",
+        headers={"Content-Disposition": "attachment; filename=recordplus.m3u"},
     )
 
 
