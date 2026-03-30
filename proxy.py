@@ -30,6 +30,20 @@ CHANNELS = {
     "sp":    {"name": "Record SP",    "event_id": "180", "group_id": "7"},
     "rio":   {"name": "Record Rio",   "event_id": "182", "group_id": "7"},
     "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
+    "Guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
+  "Bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
+  "Brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
+  "Goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
+  "Belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
+  "Manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
+  "Santos e Vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
+  "Bahia Itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
+  "Bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
+  "Rio Preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
+  "Ribeirão Preto": {"name": "Record Ribeirão Preto", "event_id": "601", "group_id": "7"},
+  "Campos dos Goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
+  
+  
 }
 
 PORT             = 8888
