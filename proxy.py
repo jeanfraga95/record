@@ -30,20 +30,6 @@ CHANNELS = {
     "sp":    {"name": "Record SP",    "event_id": "180", "group_id": "7"},
     "rio":   {"name": "Record Rio",   "event_id": "182", "group_id": "7"},
     "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
-    "Guaiba": {"name": "Record Guaiba", "event_id": "178", "group_id": "7"},
-  "Bahia": {"name": "Record Bahia", "event_id": "187", "group_id": "7"},
-  "Brasilia": {"name": "Record Brasilia", "event_id": "185", "group_id": "7"},
-  "Goias": {"name": "Record Goias", "event_id": "189", "group_id": "7"},
-  "Belem": {"name": "Record Belem", "event_id": "188", "group_id": "7"},
-  "Manaus": {"name": "Record Manaus", "event_id": "249", "group_id": "7"},
-  "Santos e Vale": {"name": "Record Santos e Vale", "event_id": "597", "group_id": "7"},
-  "Bahia Itabuna": {"name": "Record Bahia Itabuna", "event_id": "598", "group_id": "7"},
-  "Bauru": {"name": "Record Bauru", "event_id": "599", "group_id": "7"},
-  "Rio Preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
-  "Ribeirão Preto": {"name": "Record Ribeirão Preto", "event_id": "601", "group_id": "7"},
-  "Campos dos Goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
-  
-  
 }
 
 PORT             = 8888
@@ -115,8 +101,11 @@ def _make_akamai_request(url, hdntl_val, stream=False):
 
 
 def _hdntl_for_url(url):
-    """Retorna o cookie hdntl correto para uma URL Akamai."""
+    """Retorna o cookie hdntl correto para uma URL Akamai (None se nao necessario)."""
     domain = urlparse(url).netloc
+    # CDNs abertos nao precisam de hdntl
+    if "akamai" not in domain:
+        return None
     with lock:
         # Busca exata
         if domain in akamai_cookies:
@@ -236,8 +225,10 @@ def _fetch_via_playwright():
                         _dbg("[playwright] [%s] master capturado %d bytes" % (
                             _ch.upper(), len(body)))
                     except Exception as ex:
+                        # Redirect response: body indisponivel, guarda URL para fetch posterior
                         _c["master_url"] = resp.url
-                        _dbg("[playwright] [%s] body err: %s" % (_ch.upper(), ex))
+                        _c["needs_fetch"] = True
+                        _dbg("[playwright] [%s] redirect detectado, fetch posterior" % _ch.upper())
 
             page.on("response", _on_resp)
             _dbg("[playwright] [%s] Navegando…" % ch.upper())
@@ -257,6 +248,7 @@ def _fetch_via_playwright():
                 m3u8 = _extract_m3u8(page.content())
                 if m3u8:
                     captured["master_url"] = m3u8
+                    captured["needs_fetch"] = True
 
             if not captured.get("master_url"):
                 _dbg("[playwright] [%s] FALHOU" % ch.upper())
@@ -264,6 +256,25 @@ def _fetch_via_playwright():
 
             master_url = captured["master_url"]
             ak_domain  = urlparse(master_url).netloc
+
+            # Canais com redirect (cdnsimba etc): busca body via requests direto
+            if captured.get("needs_fetch") and not captured.get("master_body"):
+                _dbg("[playwright] [%s] Buscando body via requests (%s)…" % (
+                    ch.upper(), ak_domain))
+                try:
+                    r = requests.get(master_url, headers={"User-Agent": UA}, timeout=10)
+                    r.raise_for_status()
+                    captured["master_body"] = r.text
+                    # Atualiza URL final apos possiveis redirects
+                    if r.url != master_url:
+                        master_url = r.url
+                        captured["master_url"] = master_url
+                        ak_domain = urlparse(master_url).netloc
+                    _dbg("[playwright] [%s] body via requests OK (%d bytes)" % (
+                        ch.upper(), len(r.text)))
+                except Exception as ex:
+                    _dbg("[playwright] [%s] requests fallback falhou: %s" % (
+                        ch.upper(), ex))
 
             # Pega hdntl: primeiro da resposta, depois dos cookies do contexto
             hdntl_val = captured.get("hdntl")
