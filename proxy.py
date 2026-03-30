@@ -248,11 +248,16 @@ def _fetch_via_playwright():
             else:
                 _dbg("[playwright] [%s] hdntl NAO encontrado!" % ch.upper())
 
+            master_body = captured.get("master_body", "")
+            variants    = _parse_variants(master_body, master_url) if master_body else {}
+            _dbg("[playwright] [%s] variantes: %s" % (ch.upper(), list(variants.keys())))
+
             results[ch] = {
                 "master_url":  master_url,
-                "master_body": captured.get("master_body", ""),
+                "master_body": master_body,
                 "hdntl":       hdntl_val or "",
                 "ak_domain":   ak_domain,
+                "variants":    variants,
             }
 
         browser.close()
@@ -311,6 +316,54 @@ def _rewrite_m3u8(content, base_url):
     return "\n".join(out)
 
 
+def _parse_variants(content, base_url):
+    """
+    Lê o master.m3u8 e retorna dict de qualidade -> URL absoluta da variante.
+    Qualidades: fhd (1080p), hd (720p), sd (melhor abaixo de 720p)
+    """
+    parsed    = urlparse(base_url)
+    base_root = "%s://%s" % (parsed.scheme, parsed.netloc)
+    variants  = {}
+    lines     = content.splitlines()
+
+    for i, line in enumerate(lines):
+        if not line.startswith("#EXT-X-STREAM-INF"):
+            continue
+        # Proxima linha nao vazia e nao comentario = URL da variante
+        for j in range(i + 1, len(lines)):
+            url_line = lines[j].strip()
+            if not url_line or url_line.startswith("#"):
+                continue
+            # URL absoluta
+            if url_line.startswith("http"):
+                abs_url = url_line
+            else:
+                abs_url = base_root + "/" + url_line.lstrip("/")
+            # Resolucao
+            res = re.search(r"RESOLUTION=\d+x(\d+)", line)
+            if res:
+                h = int(res.group(1))
+                if h >= 1080:
+                    variants["fhd"] = abs_url
+                elif h >= 720:
+                    variants["hd"] = abs_url
+                elif h >= 480:
+                    variants.setdefault("sd", abs_url)
+                else:
+                    variants.setdefault("low", abs_url)
+            break
+
+    # Fallbacks: garante que sempre existam fhd/hd/sd
+    if "fhd" not in variants and "hd" in variants:
+        variants["fhd"] = variants["hd"]
+    if "hd" not in variants and "fhd" in variants:
+        variants["hd"] = variants["fhd"]
+    if "sd" not in variants:
+        variants["sd"] = variants.get("low") or variants.get("hd") or variants.get("fhd", "")
+
+    return {k: v for k, v in variants.items() if k in ("fhd", "hd", "sd") and v}
+
+
 # ── FLASK ─────────────────────────────────────────────────────────────────────
 app = Flask(__name__)
 
@@ -318,24 +371,44 @@ app = Flask(__name__)
 @app.route("/")
 def index():
     host = req.host.split(":")[0]
-    rows = "".join(
-        "<tr><td><b>%s</b></td><td>%s</td>"
-        "<td><code>http://%s:%d/channel/%s</code></td>"
-        "<td>%s</td></tr>" % (
-            ch.upper(), CHANNELS[ch]["name"], host, PORT, ch,
-            "OK" if ch in streams else "Aguardando"
+    QUALITY_LABEL = {"fhd": "Full HD 1080p", "hd": "HD 720p", "sd": "SD 480p"}
+    rows = []
+    for ch in CHANNELS:
+        with lock:
+            info = streams.get(ch, {})
+        status   = "OK" if ch in streams else "Aguardando"
+        variants = info.get("variants", {})
+
+        # Linha principal do canal
+        rows.append(
+            "<tr>"
+            "<td rowspan='4'><b>%s</b><br><small>%s</small></td>"
+            "<td>Todos</td>"
+            "<td><code>http://%s:%d/channel/%s</code></td>"
+            "<td>%s</td>"
+            "</tr>" % (ch.upper(), CHANNELS[ch]["name"], host, PORT, ch, status)
         )
-        for ch in CHANNELS
-    )
+        # Linhas de qualidade
+        for q in ("fhd", "hd", "sd"):
+            q_status = "OK" if q in variants else "N/A"
+            rows.append(
+                "<tr>"
+                "<td>%s</td>"
+                "<td><code>http://%s:%d/channel/%s/%s</code></td>"
+                "<td>%s</td>"
+                "</tr>" % (QUALITY_LABEL[q], host, PORT, ch, q, q_status)
+            )
+
     return (
         "<!DOCTYPE html><html><head><meta charset='utf-8'>"
         "<title>RecordPlus Proxy</title></head>"
         "<body style='font-family:sans-serif;padding:2em'>"
         "<h2>RecordPlus HLS Proxy v3</h2>"
-        "<table border='1' cellpadding='8'>"
-        "<tr><th>ID</th><th>Canal</th><th>URL VLC</th><th>Status</th></tr>"
-        + rows +
-        "</table><p><a href='/debug'>Log de diagnostico</a></p>"
+        "<p>Use os links abaixo no VLC: <b>Media &rarr; Abrir fluxo de rede</b></p>"
+        "<table border='1' cellpadding='8' cellspacing='0'>"
+        "<tr><th>Canal</th><th>Qualidade</th><th>URL para VLC</th><th>Status</th></tr>"
+        + "".join(rows) +
+        "</table><br><a href='/debug'>Log de diagnostico</a>"
         "</body></html>"
     )
 
@@ -390,6 +463,42 @@ def channel(ch):
         abort(502)
 
     content = _rewrite_m3u8(r.text, master_url)
+    return Response(content, mimetype="application/x-mpegURL",
+                    headers={"Cache-Control": "no-cache, no-store"})
+
+
+@app.route("/channel/<ch>/<quality>")
+def channel_quality(ch, quality):
+    if ch not in CHANNELS:
+        abort(404)
+    if quality not in ("fhd", "hd", "sd"):
+        abort(404)
+
+    with lock:
+        info = streams.get(ch)
+    if not info:
+        return Response(
+            "Stream nao disponivel. Aguarde ~60s.\nDiagnostico: http://%s/debug" % req.host,
+            status=503, mimetype="text/plain")
+
+    variants    = info.get("variants", {})
+    variant_url = variants.get(quality)
+
+    if not variant_url:
+        return Response(
+            "Qualidade '%s' nao disponivel para o canal %s." % (quality, ch),
+            status=404, mimetype="text/plain")
+
+    # Busca a playlist da variante com o cookie correto e reescreve URLs
+    hdntl_val = info.get("hdntl", "")
+    try:
+        r = _make_akamai_request(variant_url, hdntl_val)
+        r.raise_for_status()
+    except Exception as e:
+        _dbg("[%s/%s] Erro upstream: %s" % (ch, quality, e))
+        abort(502)
+
+    content = _rewrite_m3u8(r.text, variant_url)
     return Response(content, mimetype="application/x-mpegURL",
                     headers={"Cache-Control": "no-cache, no-store"})
 
