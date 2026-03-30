@@ -375,8 +375,11 @@ def _refresh_loop():
 
 
 # ── REESCRITA M3U8 ────────────────────────────────────────────────────────────
-def _proxy_url(url):
-    return "/proxy?u=%s" % quote(url, safe="")
+def _proxy_url(url, ch=""):
+    base = "/proxy?u=%s" % quote(url, safe="")
+    if ch:
+        base += "&_ch=%s" % quote(ch, safe="")
+    return base
 
 
 def _abs_url(url, base_root):
@@ -386,23 +389,24 @@ def _abs_url(url, base_root):
     return base_root + "/" + url.lstrip("/")
 
 
-def _rewrite_m3u8(content, base_url):
+def _rewrite_m3u8(content, base_url, ch=""):
     """
     Reescreve todas as URLs de uma playlist HLS para passar pelo proxy local.
     Trata:
       - linhas de URL (após #EXT-X-STREAM-INF etc.)
       - URI= dentro de #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF e similares
+    O parametro ch (canal) e embutido nas URLs para que o proxy saiba
+    qual origin_url usar ao renovar tokens cdnsimba.
     """
     parsed    = urlparse(base_url)
     base_root = "%s://%s" % (parsed.scheme, parsed.netloc)
     out = []
 
     def _rewrite_uri_attr(line):
-        """Substitui URI="..." dentro de uma tag HLS pelo URL do proxy."""
         def _replace(m):
             original = m.group(1)
             abs_u    = _abs_url(original, base_root)
-            return 'URI="%s"' % _proxy_url(abs_u)
+            return 'URI="%s"' % _proxy_url(abs_u, ch)
         return re.sub(r'URI="([^"]+)"', _replace, line)
 
     for line in content.splitlines():
@@ -410,15 +414,14 @@ def _rewrite_m3u8(content, base_url):
         if not s:
             out.append(line)
         elif s.startswith("#"):
-            # Reescreve URI= dentro de tags como #EXT-X-MEDIA, #EXT-X-I-FRAME-STREAM-INF
             if 'URI="' in s:
                 out.append(_rewrite_uri_attr(line))
             else:
                 out.append(line)
         elif s.startswith("http"):
-            out.append(_proxy_url(s))
+            out.append(_proxy_url(s, ch))
         else:
-            out.append(_proxy_url(base_root + "/" + s.lstrip("/")))
+            out.append(_proxy_url(base_root + "/" + s.lstrip("/"), ch))
 
     return "\n".join(out)
 
@@ -686,7 +689,7 @@ def channel(ch):
             "Stream temporariamente indisponivel. Renovando tokens, tente em 15s.",
             status=503, mimetype="text/plain")
 
-    content = _rewrite_m3u8(body, live_url)
+    content = _rewrite_m3u8(body, live_url, ch)
     return Response(content, mimetype="application/x-mpegURL",
                     headers={"Cache-Control": "no-cache, no-store"})
 
@@ -733,7 +736,7 @@ def channel_quality(ch, quality):
             "Stream temporariamente indisponivel. Renovando tokens, tente em 15s.",
             status=503, mimetype="text/plain")
 
-    content = _rewrite_m3u8(r.text, variant_url)
+    content = _rewrite_m3u8(r.text, variant_url, ch)
     return Response(content, mimetype="application/x-mpegURL",
                     headers={"Cache-Control": "no-cache, no-store"})
 
@@ -741,37 +744,40 @@ def channel_quality(ch, quality):
 @app.route("/proxy")
 def proxy():
     url = unquote(req.args.get("u", ""))
+    ch  = req.args.get("_ch", "")
     if not url:
         abort(400)
 
     hdntl_val = _hdntl_for_url(url)
     if not hdntl_val:
-        # Tenta qualquer cookie disponivel
         with lock:
             vals = list(akamai_cookies.values())
         hdntl_val = vals[0] if vals else None
 
-    # Para cdnsimba: renova token antes de buscar
+    # Para cdnsimba: renova token usando o canal exato (_ch param)
     if "cdnsimba" in url and not hdntl_val:
-        # Encontra o canal cujo cache_base bate com o domínio da URL
-        req_domain = urlparse(url).netloc
         origin_url = None
-        with lock:
-            for v in streams.values():
-                vo = v.get("origin_url", "")
-                if not vo or "cdnsimba" not in vo:
-                    continue
-                # Verifica se o token cacheado para esta origin_url tem o mesmo cache_base
-                cached = _simba_token_cache.get(vo)
-                if cached and req_domain in cached.get("cache_base", ""):
-                    origin_url = vo
-                    break
-            if not origin_url:
-                # Fallback: qualquer canal cdnsimba
-                origin_url = next(
-                    (v.get("origin_url") for v in streams.values()
-                     if "cdnsimba" in v.get("origin_url", "")), None
-                )
+        if ch:
+            # Usa o canal que gerou esta URL — token correto garantido
+            with lock:
+                origin_url = streams.get(ch, {}).get("origin_url", "")
+        if not origin_url:
+            # Fallback por domínio
+            req_domain = urlparse(url).netloc
+            with lock:
+                for v in streams.values():
+                    vo = v.get("origin_url", "")
+                    if not vo or "cdnsimba" not in vo:
+                        continue
+                    cached = _simba_token_cache.get(vo)
+                    if cached and req_domain in cached.get("cache_base", ""):
+                        origin_url = vo
+                        break
+                if not origin_url:
+                    origin_url = next(
+                        (v.get("origin_url") for v in streams.values()
+                         if "cdnsimba" in v.get("origin_url", "")), None
+                    )
         if origin_url:
             fresh_url = _simba_url_with_fresh_token(url, origin_url)
             if fresh_url != url:
@@ -793,7 +799,7 @@ def proxy():
     ct = up.headers.get("Content-Type", "application/octet-stream")
 
     if "mpegURL" in ct or url.split("?")[0].endswith(".m3u8"):
-        content = _rewrite_m3u8(up.text, url)
+        content = _rewrite_m3u8(up.text, url, ch)
         return Response(content, mimetype="application/x-mpegURL",
                         headers={"Cache-Control": "no-cache"})
 
