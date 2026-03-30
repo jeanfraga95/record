@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 RecordPlus HLS Proxy  v3
@@ -86,6 +87,9 @@ streams        = {}
 akamai_cookies = {}
 lock           = threading.Lock()
 _renewing      = False   # evita renovacoes simultaneas
+# Cache de token cdnsimba: { origin_url -> {"token": str, "cache_base": str, "ts": float} }
+_simba_token_cache = {}
+_simba_lock        = threading.Lock()
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def _extract_m3u8(text):
@@ -223,6 +227,15 @@ def _fetch_via_playwright():
                 BASE_URL, info["event_id"], info["group_id"])
             captured = {}
 
+            # Intercepta REQUEST para cdnsimba (captura origin URL com auth JWT)
+            def _on_req(request, _c=captured, _ch=ch):
+                url = request.url
+                if ("cdnsimba" in url or "brasil.cdnsimba" in url) and                    ("index.m3u8" in url or "master.m3u8" in url) and                    not _c.get("simba_origin_url"):
+                    _c["simba_origin_url"] = url
+                    _dbg("[playwright] [%s] origin_url capturada" % _ch.upper())
+
+            page.on("request", _on_req)
+
             # Intercepta RESPOSTA do master.m3u8 para pegar conteudo + Set-Cookie
             def _on_resp(resp, _c=captured, _ch=ch):
                 if "master.m3u8" in resp.url and not _c.get("master_url"):
@@ -255,6 +268,7 @@ def _fetch_via_playwright():
                 page.wait_for_timeout(500)
 
             page.remove_listener("response", _on_resp)
+            page.remove_listener("request", _on_req)
 
             if not captured.get("master_url"):
                 m3u8 = _extract_m3u8(page.content())
@@ -323,7 +337,7 @@ def _fetch_via_playwright():
                 "hdntl":       hdntl_val or "",
                 "ak_domain":   ak_domain,
                 "variants":    variants,
-                "origin_url":  captured.get("origin_url", ""),  # URL pre-redirect (cdnsimba)
+                "origin_url":  captured.get("simba_origin_url") or captured.get("origin_url", ""),
             }
 
         browser.close()
@@ -430,6 +444,58 @@ def _parse_variants(content, base_url):
     return {k: v for k, v in variants.items() if k in ("fhd", "hd", "sd") and v}
 
 
+def _get_fresh_simba_token(origin_url):
+    """
+    Faz GET na origin_url do cdnsimba (sem seguir redirect),
+    extrai o token fresco do header Location e cacheia por 45s.
+    Retorna (cache_base, fresh_token) ou (None, None) se falhar.
+    """
+    with _simba_lock:
+        cached = _simba_token_cache.get(origin_url)
+        if cached and (time.time() - cached["ts"]) < 45:
+            return cached["cache_base"], cached["token"]
+
+    try:
+        r = requests.get(origin_url, headers={"User-Agent": UA,
+                         "Referer": BASE_URL + "/", "Origin": BASE_URL},
+                         timeout=10, allow_redirects=False)
+        location = r.headers.get("Location", "")
+        # Location: https://cache01sp.cdnsimba.com.br:443/bpk-token/TOKEN/path
+        m = re.match(r"(https://[^/]+)/bpk-token/([^/]+)/", location)
+        if not m:
+            return None, None
+        cache_base  = m.group(1)   # https://cache01sp.cdnsimba.com.br:443
+        fresh_token = m.group(2)   # 2ac@xxxxx
+        with _simba_lock:
+            _simba_token_cache[origin_url] = {
+                "cache_base": cache_base,
+                "token":      fresh_token,
+                "ts":         time.time(),
+            }
+        _dbg("[simba] token fresco: %s…" % fresh_token[:20])
+        return cache_base, fresh_token
+    except Exception as e:
+        _dbg("[simba] erro ao renovar token: %s" % e)
+        return None, None
+
+
+def _simba_url_with_fresh_token(orig_cdnsimba_url, origin_url):
+    """
+    Dado uma URL cdnsimba com token velho (ex: cache01sp.../bpk-token/OLD/linear/...),
+    retorna a mesma URL com token fresco.
+    """
+    cache_base, fresh_token = _get_fresh_simba_token(origin_url)
+    if not cache_base or not fresh_token:
+        return orig_cdnsimba_url  # fallback: usa URL velha
+
+    # Extrai o path lógico após o token: /linear/hls/pa/event/...
+    m = re.search(r"/bpk-token/[^/]+(/.*)", orig_cdnsimba_url)
+    if not m:
+        return orig_cdnsimba_url
+    logical_path = m.group(1)
+    return "%s/bpk-token/%s%s" % (cache_base, fresh_token, logical_path)
+
+
 def _fetch_master_live(info):
     """
     Re-busca o master.m3u8 ao vivo e retorna (body, master_url).
@@ -441,11 +507,20 @@ def _fetch_master_live(info):
     hdntl_val  = info.get("hdntl", "")
 
     if origin_url:
-        # cdnsimba: origin_url gera redirect com novo token a cada requisicao
-        r = requests.get(origin_url, headers={"User-Agent": UA},
-                         timeout=10, allow_redirects=True)
+        # cdnsimba: pega token fresco e monta URL com ele
+        cache_base, fresh_token = _get_fresh_simba_token(origin_url)
+        if cache_base and fresh_token:
+            # Extrai path base do master (ex: /bpk-tv/RecordMANSRT/default/index.m3u8)
+            m = re.search(r"/bpk-token/[^/]+(/.*)", info.get("master_url", ""))
+            if m:
+                fresh_url = "%s/bpk-token/%s%s" % (cache_base, fresh_token, m.group(1))
+            else:
+                fresh_url = info["master_url"]
+        else:
+            fresh_url = info["master_url"]
+        r = requests.get(fresh_url, headers={"User-Agent": UA}, timeout=10)
         r.raise_for_status()
-        return r.text, r.url
+        return r.text, fresh_url
     else:
         # Akamai: usa hdntl cookie
         r = _make_akamai_request(master_url, hdntl_val)
@@ -649,12 +724,27 @@ def proxy():
             vals = list(akamai_cookies.values())
         hdntl_val = vals[0] if vals else None
 
+    # Para cdnsimba: renova token antes de buscar
+    if "cdnsimba" in url and not hdntl_val:
+        # Descobre qual canal tem origin_url correspondente
+        with lock:
+            origin_url = next(
+                (v.get("origin_url") for v in streams.values()
+                 if v.get("origin_url") and "cdnsimba" in v.get("origin_url", "")),
+                None
+            )
+        if origin_url:
+            fresh_url = _simba_url_with_fresh_token(url, origin_url)
+            if fresh_url != url:
+                _dbg("proxy [simba] token renovado para segmento")
+                url = fresh_url
+
     try:
         if hdntl_val:
             up = _make_akamai_request(url, hdntl_val, stream=True)
         else:
-            # CDN aberto (cdnsimba etc): sem cookie, segue redirects
-            up = requests.get(url, headers={"User-Agent": UA},
+            up = requests.get(url, headers={"User-Agent": UA,
+                              "Referer": BASE_URL + "/", "Origin": BASE_URL},
                               stream=True, timeout=15, allow_redirects=True)
         up.raise_for_status()
     except Exception as e:
