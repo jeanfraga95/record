@@ -40,6 +40,15 @@ CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"}
             "rio_preto": {"name": "Record Rio Preto", "event_id": "600", "group_id": "7"},
             "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
             "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
+            "Nsports": {"name":"Nsports", "event_id": "644","group_id":"76"},
+            "Manual_do_Mundo": {"name":"Manual do Mundo", "event_id": "630","group_id":"65"},
+            "Acelerados": {"name":"Acelerados", "event_id": "625","group_id":"63"},
+             "good_game_tv": {"name":"Good Game TV", "event_id": "629","group_id":"66"},
+             "Desimpedidos": {"name":"Nsports", "event_id": "627","group_id":"64"},
+             "canal_do_artesanato": {"name":"Canal do Artesanato", "event_id": "626","group_id":"68"},
+             "Record_news": {"name":"Record News", "event_id": "191","group_id":"10"},
+             "Desimpedidos": {"name":"Nsports", "event_id": "627","group_id":"64"},
+            
            }
 
 PORT             = 8888
