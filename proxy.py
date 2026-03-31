@@ -1,5 +1,3 @@
-
-
 #!/usr/bin/env python3
 """
 RecordPlus HLS Proxy  v3
@@ -27,7 +25,6 @@ from flask import Flask, Response, request as req, abort
 EMAIL        = "jean.fraga20@gmail.com"
 PASSWORD     = "qwerty123"
 PROFILE_ID   = "8a7ea0f8-c8c1-4a29-b424-14bbf7ee9275"
-
 CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"},     
             "rio": {"name": "Record Rio", "event_id": "182", "group_id": "7"},
             "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
@@ -44,7 +41,6 @@ CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"}
             "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
             "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
            }
-
 
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min
@@ -91,6 +87,7 @@ _renewing      = False   # evita renovacoes simultaneas
 # Cache de token cdnsimba: { origin_url -> {"token": str, "cache_base": str, "ts": float} }
 _simba_token_cache = {}
 _simba_lock        = threading.Lock()
+_session_cookies   = []   # cookies Playwright salvos apos login
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 def _extract_m3u8(text):
@@ -221,6 +218,11 @@ def _fetch_via_playwright():
             except PWTimeout:
                 page.wait_for_timeout(3000)
             _dbg("[playwright] URL apos perfil: " + page.url)
+
+        # Salva cookies da sessão para re-uso posterior sem novo login
+        global _session_cookies
+        _session_cookies = ctx.cookies()
+        _dbg("[playwright] %d cookies salvos para reuso" % len(_session_cookies))
 
         # Captura por canal
         for ch, info in CHANNELS.items():
@@ -392,12 +394,92 @@ def _warmup_simba_tokens():
             _dbg("[simba] [%s] erro: %s" % (ch, e))
 
 
+def _recapture_simba_origins():
+    """
+    Reabre o Playwright com os cookies salvos (sem novo login) e
+    re-navega apenas pelos canais cdnsimba para obter JWTs frescos.
+    """
+    global _session_cookies
+    if not _session_cookies:
+        _dbg("[simba] sem cookies de sessao, aguardando captura inicial…")
+        return
+
+    from playwright.sync_api import sync_playwright, TimeoutError as PWTimeout
+
+    with lock:
+        simba_chs = {
+            ch: info for ch, info in streams.items()
+            if info.get("origin_url") and "cdnsimba" in info.get("origin_url", "")
+        }
+    if not simba_chs:
+        return
+
+    _dbg("[simba] Recapturando JWTs para: %s" % list(simba_chs.keys()))
+
+    try:
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=True,
+                args=["--no-sandbox", "--disable-setuid-sandbox",
+                      "--disable-dev-shm-usage", "--disable-gpu", "--single-process"],
+            )
+            ctx  = browser.new_context(user_agent=UA, viewport={"width": 1280, "height": 720})
+            # Restaura cookies da sessao (ja logado)
+            ctx.add_cookies(_session_cookies)
+            page = ctx.new_page()
+
+            for ch, info in simba_chs.items():
+                ch_url    = "%s/Live/LiveEvent/%s?groupId=%s" % (
+                    BASE_URL, CHANNELS[ch]["event_id"], CHANNELS[ch]["group_id"])
+                captured  = {}
+
+                def _on_req(request, _c=captured, _ch=ch):
+                    url = request.url
+                    if ("cdnsimba" in url or "brasil.cdnsimba" in url) and                        ("index.m3u8" in url or "master.m3u8" in url) and                        not _c.get("origin_url"):
+                        _c["origin_url"] = url
+                        _dbg("[simba] [%s] novo JWT capturado" % _ch.upper())
+
+                page.on("request", _on_req)
+                try:
+                    page.goto(ch_url, wait_until="domcontentloaded", timeout=15000)
+                except PWTimeout:
+                    pass
+                # Aguarda até 6s pelo JWT
+                for _ in range(12):
+                    if captured.get("origin_url"):
+                        break
+                    page.wait_for_timeout(500)
+                page.remove_listener("request", _on_req)
+
+                if captured.get("origin_url"):
+                    with lock:
+                        if ch in streams:
+                            streams[ch]["origin_url"] = captured["origin_url"]
+                    # Invalida cache antigo para forçar token fresco
+                    with _simba_lock:
+                        _simba_token_cache.pop(captured["origin_url"], None)
+                    _dbg("[simba] [%s] origin_url atualizada" % ch.upper())
+                else:
+                    _dbg("[simba] [%s] JWT NAO capturado, sessao pode ter expirado" % ch.upper())
+
+            browser.close()
+    except Exception:
+        _dbg("[simba] ERRO na recaptura:\n" + traceback.format_exc())
+
+    # Aquece tokens com os novos JWTs
+    _warmup_simba_tokens()
+
+
 def _simba_loop():
-    """Renova tokens cdnsimba a cada 3 minutos indefinidamente."""
+    """
+    A cada 5 minutos:
+      1. Re-captura JWTs frescos dos canais cdnsimba via Playwright (sem login)
+      2. Aquece o cache de bpk-tokens com os novos JWTs
+    """
     while True:
-        time.sleep(180)
+        time.sleep(300)   # 5 minutos
         try:
-            _warmup_simba_tokens()
+            _recapture_simba_origins()
         except Exception:
             _dbg("[simba] ERRO no loop:\n" + traceback.format_exc())
 
