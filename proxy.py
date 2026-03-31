@@ -1,3 +1,5 @@
+
+
 #!/usr/bin/env python3
 """
 RecordPlus HLS Proxy  v3
@@ -42,6 +44,7 @@ CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"}
             "ribeirao_preto": {"name": "Record Ribeirao Preto", "event_id": "601", "group_id": "7"},
             "campos_goytacazes": {"name": "Record Campos dos Goytacazes", "event_id": "602", "group_id": "7"},
            }
+
 
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min
@@ -364,10 +367,47 @@ def fetch_streams():
         _dbg("ERRO:\n" + traceback.format_exc())
 
 
+def _warmup_simba_tokens():
+    """
+    Aquece o cache de tokens cdnsimba para todos os canais capturados.
+    Chamado logo após fetch_streams() e a cada 3 minutos em background.
+    """
+    with lock:
+        simba_channels = {
+            ch: info for ch, info in streams.items()
+            if info.get("origin_url") and "cdnsimba" in info.get("origin_url", "")
+        }
+    if not simba_channels:
+        return
+    _dbg("[simba] Aquecendo tokens para: %s" % list(simba_channels.keys()))
+    for ch, info in simba_channels.items():
+        origin_url = info["origin_url"]
+        try:
+            cache_base, token = _get_fresh_simba_token(origin_url)
+            if token:
+                _dbg("[simba] [%s] token OK (%s...)" % (ch, token[:15]))
+            else:
+                _dbg("[simba] [%s] token FALHOU — origin_url JWT pode ter expirado" % ch)
+        except Exception as e:
+            _dbg("[simba] [%s] erro: %s" % (ch, e))
+
+
+def _simba_loop():
+    """Renova tokens cdnsimba a cada 3 minutos indefinidamente."""
+    while True:
+        time.sleep(180)
+        try:
+            _warmup_simba_tokens()
+        except Exception:
+            _dbg("[simba] ERRO no loop:\n" + traceback.format_exc())
+
+
 def _refresh_loop():
     while True:
         try:
             fetch_streams()
+            # Aquece cache cdnsimba imediatamente após captura
+            _warmup_simba_tokens()
         except Exception:
             _dbg("ERRO CRITICO:\n" + traceback.format_exc())
         _dbg("Proxima renovacao em %d min" % (REFRESH_INTERVAL // 60))
@@ -820,6 +860,8 @@ if __name__ == "__main__":
 
     t = threading.Thread(target=_refresh_loop, daemon=True, name="refresh")
     t.start()
+    ts = threading.Thread(target=_simba_loop, daemon=True, name="simba-token")
+    ts.start()
 
     # Flask sobe imediatamente — captura roda em background
     print("Flask subindo agora. Streams chegarao em ~2min.", flush=True)
