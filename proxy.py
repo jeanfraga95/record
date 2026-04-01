@@ -25,6 +25,7 @@ from flask import Flask, Response, request as req, abort
 EMAIL        = "jean.fraga20@gmail.com"
 PASSWORD     = "qwerty123"
 PROFILE_ID   = "8a7ea0f8-c8c1-4a29-b424-14bbf7ee9275"
+
 CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"},     
             "rio": {"name": "Record Rio", "event_id": "182", "group_id": "7"},
             "minas": {"name": "Record Minas", "event_id": "186", "group_id": "7"},
@@ -54,6 +55,10 @@ CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"}
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min
 BASE_URL         = "https://www.recordplus.com"
+
+# ── Credenciais do painel web ──────────────────────────────────────────────────
+PANEL_USER     = "admin"
+PANEL_PASSWORD = "admin123"
 UA               = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                     "AppleWebKit/537.36 (KHTML, like Gecko) "
                     "Chrome/124.0.0.0 Safari/537.36")
@@ -690,10 +695,90 @@ def _fetch_master_live(info):
 
 
 # ── FLASK ─────────────────────────────────────────────────────────────────────
+import secrets
+import hashlib
+from functools import wraps
+from flask import session, redirect, url_for
+
 app = Flask(__name__)
+app.secret_key = secrets.token_hex(32)   # chave aleatória gerada na inicialização
+
+
+def _check_auth(username, password):
+    """Verifica credenciais com comparação segura (evita timing attacks)."""
+    ok_user = secrets.compare_digest(username, PANEL_USER)
+    ok_pass = secrets.compare_digest(password, PANEL_PASSWORD)
+    return ok_user and ok_pass
+
+
+def _login_required(f):
+    """Decorator: redireciona para login se não autenticado."""
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect("/login")
+        return f(*args, **kwargs)
+    return decorated
+
+
+LOGIN_HTML = """<!DOCTYPE html>
+<html><head><meta charset='utf-8'>
+<title>RecordPlus Proxy — Login</title>
+<style>
+  * {{ box-sizing: border-box; margin: 0; padding: 0; }}
+  body {{ background: #1a1a2e; display: flex; justify-content: center;
+          align-items: center; min-height: 100vh; font-family: sans-serif; }}
+  .card {{ background: #16213e; border-radius: 12px; padding: 40px 36px;
+           width: 340px; box-shadow: 0 8px 32px rgba(0,0,0,.4); }}
+  h2 {{ color: #e0e0e0; text-align: center; margin-bottom: 8px; font-size: 20px; }}
+  p.sub {{ color: #888; text-align: center; font-size: 13px; margin-bottom: 28px; }}
+  label {{ color: #aaa; font-size: 13px; display: block; margin-bottom: 6px; }}
+  input {{ width: 100%; padding: 10px 14px; border-radius: 6px; border: 1px solid #2a4080;
+           background: #0f3460; color: #e0e0e0; font-size: 14px; margin-bottom: 18px;
+           outline: none; }}
+  input:focus {{ border-color: #e53935; }}
+  button {{ width: 100%; padding: 11px; background: #e53935; color: #fff;
+            border: none; border-radius: 6px; font-size: 15px; font-weight: bold;
+            cursor: pointer; transition: background .2s; }}
+  button:hover {{ background: #c62828; }}
+  .error {{ background: #4a0000; color: #ff8a80; border-radius: 6px;
+            padding: 10px 14px; font-size: 13px; margin-bottom: 16px; text-align:center; }}
+</style></head>
+<body><div class='card'>
+  <h2>📺 RecordPlus Proxy</h2>
+  <p class='sub'>Acesso restrito</p>
+  {error}
+  <form method='POST' action='/login'>
+    <label>Usuário</label>
+    <input type='text' name='username' autofocus autocomplete='username'>
+    <label>Senha</label>
+    <input type='password' name='password' autocomplete='current-password'>
+    <button type='submit'>Entrar</button>
+  </form>
+</div></body></html>"""
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    if req.method == "POST":
+        username = req.form.get("username", "")
+        password = req.form.get("password", "")
+        if _check_auth(username, password):
+            session["logged_in"] = True
+            return redirect("/")
+        error = "<div class='error'>Usuário ou senha incorretos.</div>"
+        return LOGIN_HTML.format(error=error), 401
+    return LOGIN_HTML.format(error="")
+
+
+@app.route("/logout")
+def logout():
+    session.clear()
+    return redirect("/login")
 
 
 @app.route("/")
+@_login_required
 def index():
     host = req.host.split(":")[0]
     QUALITY_LABEL = {"fhd": "Full HD 1080p", "hd": "HD 720p", "sd": "SD 480p"}
@@ -743,6 +828,7 @@ def index():
 
 
 @app.route("/playlist.m3u")
+@_login_required
 def playlist_m3u():
     host = req.host.split(":")[0]
     QUALITY_LABEL = {"fhd": "Full HD 1080p", "hd": "HD 720p", "sd": "SD 480p"}
@@ -777,6 +863,7 @@ def playlist_m3u():
 
 
 @app.route("/debug")
+@_login_required
 def debug():
     with lock:
         info = {ch: {
@@ -794,6 +881,7 @@ def debug():
 
 
 @app.route("/channel/<ch>")
+@_login_required
 def channel(ch):
     if ch not in CHANNELS:
         abort(404)
@@ -826,6 +914,7 @@ def channel(ch):
 
 
 @app.route("/channel/<ch>/<quality>")
+@_login_required
 def channel_quality(ch, quality):
     if ch not in CHANNELS:
         abort(404)
@@ -873,6 +962,7 @@ def channel_quality(ch, quality):
 
 
 @app.route("/proxy")
+@_login_required
 def proxy():
     url = unquote(req.args.get("u", ""))
     ch  = req.args.get("_ch", "")
