@@ -51,7 +51,6 @@ CHANNELS = {     "sp": {"name": "Record SP", "event_id": "180", "group_id": "7"}
              "Desimpedidos": {"name":"Nsports", "event_id": "627","group_id":"64"},
             
            }
-
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min
 BASE_URL         = "https://www.recordplus.com"
@@ -881,7 +880,6 @@ def debug():
 
 
 @app.route("/channel/<ch>")
-@_login_required
 def channel(ch):
     if ch not in CHANNELS:
         abort(404)
@@ -914,7 +912,6 @@ def channel(ch):
 
 
 @app.route("/channel/<ch>/<quality>")
-@_login_required
 def channel_quality(ch, quality):
     if ch not in CHANNELS:
         abort(404)
@@ -962,7 +959,6 @@ def channel_quality(ch, quality):
 
 
 @app.route("/proxy")
-@_login_required
 def proxy():
     url = unquote(req.args.get("u", ""))
     ch  = req.args.get("_ch", "")
