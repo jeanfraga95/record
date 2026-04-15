@@ -1,17 +1,17 @@
 #!/usr/bin/env bash
 # ============================================================
-#  SKY Proxy — Instalador para Ubuntu 22.04 (ARM/x64)
+#  record Proxy — Instalador para Ubuntu 22.04 (ARM/x64)
 #  Execute como root: sudo bash install.sh
 # ============================================================
 set -euo pipefail
 
-INSTALL_DIR="/opt/sky-proxy"
-SERVICE_NAME="sky-proxy"
+INSTALL_DIR="/opt/record-proxy"
+SERVICE_NAME="record-proxy"
 PYTHON="python3"
-GITHUB_RAW="https://raw.githubusercontent.com/jeanfraga95/sky-nv/main/proxy.py"
+GITHUB_RAW="https://raw.githubusercontent.com/jeanfraga95/record/refs/heads/main/proxy.py"
 
 echo "========================================================"
-echo "  SKY HLS Proxy — Instalação"
+echo "  Record HLS Proxy — Instalação"
 echo "========================================================"
 
 # ── dependências do sistema ──────────────────────────────────
@@ -52,7 +52,7 @@ echo "[5/6] Criando serviço systemd…"
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
 Description=R
-SKY HLS Proxy
+record HLS Proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -103,5 +103,5 @@ echo "    http://${PUBLIC_IP}:8888/"
 echo ""
 echo "  Logs:"
 echo "    journalctl -u ${SERVICE_NAME} -f"
-echo "    tail -f /var/log/sky-proxy.log"
+echo "    tail -f /var/log/record-proxy.log"
 echo "========================================================"
