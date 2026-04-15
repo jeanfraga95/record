@@ -1,58 +1,88 @@
 #!/usr/bin/env bash
 # ============================================================
-#  record Proxy — Instalador para Ubuntu 22.04 (ARM/x64)
-#  Execute como root: sudo bash install.sh
+#  RecordPlus Proxy — Instalador com REINSTALAÇÃO AUTOMÁTICA
 # ============================================================
 set -euo pipefail
 
-INSTALL_DIR="/opt/record-proxy"
-SERVICE_NAME="record-proxy"
+INSTALL_DIR="/opt/recordplus-proxy"
+SERVICE_NAME="recordplus-proxy"
 PYTHON="python3"
-GITHUB_RAW="https://raw.githubusercontent.com/jeanfraga95/record/refs/heads/main/proxy.py"
+GITHUB_RAW="https://raw.githubusercontent.com/jeanfraga95/record/main/proxy.py"
+PORT="8888"
 
 echo "========================================================"
-echo "  Record HLS Proxy — Instalação"
+echo "  RecordPlus HLS Proxy — Instalação/Reinstalação"
 echo "========================================================"
 
-# ── dependências do sistema ──────────────────────────────────
-echo "[1/6] Atualizando pacotes do sistema…"
+# ── limpeza de instalação anterior ───────────────────────────
+echo "[0/6] Verificando instalação anterior…"
+
+if systemctl list-units --full -all | grep -q "${SERVICE_NAME}.service"; then
+    echo "  Parando serviço antigo…"
+    systemctl stop ${SERVICE_NAME} || true
+    systemctl disable ${SERVICE_NAME} || true
+fi
+
+if [ -f "/etc/systemd/system/${SERVICE_NAME}.service" ]; then
+    echo "  Removendo service antigo…"
+    rm -f /etc/systemd/system/${SERVICE_NAME}.service
+    systemctl daemon-reload
+fi
+
+if [ -d "$INSTALL_DIR" ]; then
+    echo "  Removendo diretório antigo…"
+    rm -rf "$INSTALL_DIR"
+fi
+
+# ── mata processo na porta ───────────────────────────────────
+echo "  Verificando porta ${PORT}…"
+if lsof -i :${PORT} >/dev/null 2>&1; then
+    echo "  Porta em uso. Matando processo…"
+    lsof -t -i :${PORT} | xargs -r kill -9
+    sleep 1
+    echo "  ✓ Porta liberada"
+else
+    echo "  Porta livre"
+fi
+
+# ── dependências ─────────────────────────────────────────────
+echo "[1/6] Atualizando pacotes…"
 apt-get update -y
 apt-get install -y python3 python3-pip python3-venv \
-    curl wget git \
+    curl wget git lsof \
     libnss3 libatk1.0-0 libatk-bridge2.0-0 libcups2 \
     libdrm2 libxkbcommon0 libxcomposite1 libxdamage1 \
     libxfixes3 libxrandr2 libgbm1 libasound2 \
     fonts-liberation xdg-utils
 
-# ── diretório de instalação ──────────────────────────────────
-echo "[2/6] Criando diretório $INSTALL_DIR…"
+# ── diretório ────────────────────────────────────────────────
+echo "[2/6] Criando diretório…"
 mkdir -p "$INSTALL_DIR"
 
-echo "  Baixando proxy.py do GitHub…"
+echo "  Baixando proxy.py…"
 curl -fsSL "$GITHUB_RAW" -o "$INSTALL_DIR/proxy.py"
-echo "  ✓ proxy.py baixado com sucesso."
+echo "  ✓ Download concluído"
 
-# ── ambiente Python virtual ──────────────────────────────────
-echo "[3/6] Criando ambiente virtual Python…"
+# ── venv ────────────────────────────────────────────────────
+echo "[3/6] Criando ambiente Python…"
 $PYTHON -m venv "$INSTALL_DIR/venv"
 source "$INSTALL_DIR/venv/bin/activate"
 
 pip install --upgrade pip
 pip install flask requests playwright
 
-# ── Chromium via Playwright ──────────────────────────────────
-echo "[4/6] Instalando Chromium (Playwright)…"
+# ── playwright ──────────────────────────────────────────────
+echo "[4/6] Instalando Chromium…"
 python -m playwright install chromium
 python -m playwright install-deps chromium
 
 deactivate
 
-# ── serviço systemd ──────────────────────────────────────────
-echo "[5/6] Criando serviço systemd…"
+# ── systemd ─────────────────────────────────────────────────
+echo "[5/6] Criando serviço…"
 cat > /etc/systemd/system/${SERVICE_NAME}.service <<EOF
 [Unit]
-Description=R
-record HLS Proxy
+Description=RecordPlus HLS Proxy
 After=network-online.target
 Wants=network-online.target
 
@@ -72,36 +102,33 @@ WantedBy=multi-user.target
 EOF
 
 systemctl daemon-reload
-systemctl enable  ${SERVICE_NAME}
+systemctl enable ${SERVICE_NAME}
 systemctl restart ${SERVICE_NAME}
 
-# ── abre porta no firewall (se ufw ativo) ──────────────────
-echo "[6/6] Abrindo porta 8888 no firewall…"
+# ── firewall ────────────────────────────────────────────────
+echo "[6/6] Liberando porta ${PORT}…"
 if command -v ufw &>/dev/null && ufw status | grep -q "Status: active"; then
-    ufw allow 8888/tcp
-    echo "  ufw: porta 8888 liberada."
+    ufw allow ${PORT}/tcp
+    echo "  ✓ Porta liberada no ufw"
 else
-    echo "  ufw não está ativo — verifique as regras de iptables/oci manualmente."
+    echo "  ufw não ativo"
 fi
 
-# ── resultado ─────────────────────────────────────────────────
+# ── final ───────────────────────────────────────────────────
 PUBLIC_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null || echo "<SEU_IP>")
+
 echo ""
 echo "========================================================"
 echo "  Instalação concluída!"
 echo ""
-echo "  O proxy inicia em background. Aguarde ~30 s para"
-echo "  o login e captura dos streams ficarem prontos."
+echo "  URLs:"
+echo "    http://${PUBLIC_IP}:${PORT}/channel/sp"
+echo "    http://${PUBLIC_IP}:${PORT}/channel/rio"
+echo "    http://${PUBLIC_IP}:${PORT}/channel/minas"
 echo ""
-echo "  URLs para VLC (Mídia → Abrir fluxo de rede):"
-echo "    http://${PUBLIC_IP}:8888/channel/sp"
-echo "    http://${PUBLIC_IP}:8888/channel/rio"
-echo "    http://${PUBLIC_IP}:8888/channel/minas"
-echo ""
-echo "  Painel web:"
-echo "    http://${PUBLIC_IP}:8888/"
+echo "  Painel:"
+echo "    http://${PUBLIC_IP}:${PORT}/"
 echo ""
 echo "  Logs:"
 echo "    journalctl -u ${SERVICE_NAME} -f"
-echo "    tail -f /var/log/record-proxy.log"
 echo "========================================================"
