@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-RecordPlus HLS Proxy  v3.1
+RecordPlus HLS Proxy  v3.0
 ===========================
 Links fixos para VLC:
   http://<IP>:8888/channel/sp
@@ -60,7 +60,7 @@ CHANNELS = {
 
 PORT             = 8888
 REFRESH_INTERVAL = 1500   # 25 min — renovação completa via Playwright
-SIMBA_LOOP_INTERVAL = 10 # 10 segundos — recaptura de JWTs cdnsimba (era 5 min)
+SIMBA_LOOP_INTERVAL = 180 # 3 min — recaptura de JWTs cdnsimba (era 5 min)
 BASE_URL         = "https://www.recordplus.com"
 
 # ── Credenciais do painel web ──────────────────────────────────────────────────
